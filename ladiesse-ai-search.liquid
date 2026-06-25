@@ -103,6 +103,9 @@
   var API_URL = 'YOUR_VERCEL_URL_HERE/api/search';
   // ──────────────────────────────────────────────────────────────────────────
 
+  var CACHE_KEY = 'lai_products_v1';
+  var CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
   // Fallback keyword engine (runs if API is unavailable)
   var SYNONYMS = {
     "flowy":["flowy","wrap","slip","maxi","ruffle","midi","linen","relaxed","tiered","airy"],
@@ -150,20 +153,99 @@
     return kw;
   }
 
+  function stripHtml(html) {
+    var d = document.createElement('div');
+    d.innerHTML = html;
+    return (d.textContent || d.innerText || '').replace(/\s+/g, ' ').trim();
+  }
+
+  // Trim a raw Shopify product down to what we store/send
+  function normalizeProduct(p) {
+    return {
+      handle: p.handle,
+      title: p.title,
+      vendor: p.vendor,
+      product_type: p.product_type || '',
+      tags: p.tags || [],
+      images: (p.images || []).slice(0, 1),
+      variants: (p.variants || []).map(function(v) {
+        return { price: v.price, available: v.available };
+      }),
+      desc: p.body_html ? stripHtml(p.body_html).slice(0, 200) : ''
+    };
+  }
+
+  function getCachedProducts() {
+    try {
+      var raw = localStorage.getItem(CACHE_KEY);
+      if (!raw) return null;
+      var obj = JSON.parse(raw);
+      if (Date.now() - obj.ts > CACHE_TTL) return null;
+      return obj.products;
+    } catch(e) { return null; }
+  }
+
+  function setCachedProducts(products) {
+    try {
+      localStorage.setItem(CACHE_KEY, JSON.stringify({ ts: Date.now(), products: products }));
+    } catch(e) {}
+  }
+
   function scoreFallback(p,kw,min,max){
     var price=parseFloat(p.variants[0].price);
     if(price<min||price>max)return -1;
-    var blob=[(p.tags||[]).join(' '),p.title,p.vendor,p.product_type].join(' ').toLowerCase();
+    var blob=[(p.tags||[]).join(' '),p.title,p.vendor,p.product_type,p.desc||''].join(' ').toLowerCase();
     var score=0;
     Object.keys(kw).forEach(function(k){if(blob.indexOf(k)!==-1)score+=2;});
     return score;
   }
 
-  function fetchProducts(cb){
-    fetch('/collections/all/products.json?limit=250')
-      .then(function(r){return r.json();})
-      .then(function(d){cb(null,d.products||[]);})
-      .catch(function(e){cb(e,[]);});
+  // Fetch all pages of products, normalize, then cache
+  function fetchAllProducts(cb) {
+    var cached = getCachedProducts();
+    if (cached) { cb(null, cached); return; }
+
+    var all = [];
+    var page = 1;
+    var MAX_PAGES = 10; // up to 2500 products
+
+    function fetchPage() {
+      fetch('/collections/all/products.json?limit=250&page=' + page)
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+          var batch = (d.products || []).map(normalizeProduct);
+          all = all.concat(batch);
+          if (d.products.length === 250 && page < MAX_PAGES) {
+            page++;
+            fetchPage();
+          } else {
+            setCachedProducts(all);
+            cb(null, all);
+          }
+        })
+        .catch(function(e) {
+          if (all.length) cb(null, all);
+          else cb(e, []);
+        });
+    }
+
+    fetchPage();
+  }
+
+  // Pre-score the full catalog and return the top 250 candidates for Claude.
+  // Filters sold-out items and respects any budget constraint in the query.
+  // Puts keyword-matching products first so Claude sees the best candidates.
+  function prescoreForClaude(products, q) {
+    var budget = parseBudget(q);
+    var kw = extractKeywords(q);
+    var scored = products
+      .filter(function(p) {
+        return p.variants && p.variants.some(function(v) { return v.available; });
+      })
+      .map(function(p) { return { p: p, score: scoreFallback(p, kw, budget.min, budget.max) }; })
+      .filter(function(x) { return x.score >= 0; }); // drop out-of-budget
+    scored.sort(function(a, b) { return b.score - a.score; });
+    return scored.slice(0, 250).map(function(x) { return x.p; });
   }
 
   function renderCard(p){
@@ -208,19 +290,19 @@
     setMessage('✦ '+LOADING_MSGS[Math.floor(Math.random()*LOADING_MSGS.length)]);
     setGrid('');
 
-    fetchProducts(function(err,products){
+    fetchAllProducts(function(err,products){
       if(err||!products.length){
         setMessage('✦ Something went sideways — try again in a sec 💫');
         btn.disabled=false; btn.style.opacity='1';
         return;
       }
 
-      // Try Claude API first
       if(API_URL.indexOf('YOUR_VERCEL_URL_HERE')===-1){
+        var candidates = prescoreForClaude(products, q);
         fetch(API_URL,{
           method:'POST',
           headers:{'Content-Type':'application/json'},
-          body:JSON.stringify({query:q,products:products})
+          body:JSON.stringify({query:q,products:candidates})
         })
         .then(function(r){return r.json();})
         .then(function(data){
@@ -237,12 +319,10 @@
           setGrid(matched.map(renderCard).join(''));
         })
         .catch(function(){
-          // Silently fall back to keyword matching if API fails
           runFallback(q,products);
           btn.disabled=false; btn.style.opacity='1';
         });
       } else {
-        // No API URL set yet — use keyword fallback
         runFallback(q,products);
         btn.disabled=false; btn.style.opacity='1';
       }

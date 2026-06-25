@@ -5,7 +5,7 @@ Ladiesse is a curated marketplace of women's fashion, art tees, and home goods f
 
 You will receive:
 1. A shopper's natural language query
-2. A JSON array of available products (title, vendor, price, tags, handle)
+2. A JSON array of available products (title, vendor, price, tags, type, desc, handle)
 
 Your job is to select the best matching products and respond ONLY with a raw JSON object — no markdown, no explanation, no code fences.
 
@@ -66,14 +66,14 @@ export default async function handler(req) {
     });
   }
 
-  // Trim product list to keep tokens low — send only what Claude needs
-  const trimmed = products.slice(0, 200).map((p) => ({
+  const trimmed = products.slice(0, 250).map((p) => ({
     handle: p.handle,
     title: p.title,
     vendor: p.vendor,
     price: parseFloat(p.variants?.[0]?.price || 0),
-    tags: (p.tags || []).slice(0, 10).join(", "),
+    tags: (p.tags || []).join(", "),
     type: p.product_type || "",
+    desc: (p.desc || "").slice(0, 150),
   }));
 
   const userMessage = `Shopper query: "${query}"\n\nAvailable products:\n${JSON.stringify(trimmed)}`;
